@@ -7,8 +7,8 @@ Created on Sat Jun 13 16:26:13 2020
 
 @author: kutkin
 """
-import matplotlib
-matplotlib.use('Agg')
+# import matplotlib
+# matplotlib.use('Agg')
 
 
 import os
@@ -25,10 +25,14 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 from astropy.wcs import WCS
 from radio_beam import Beam, Beams
 
+import shutil
+from atools.utils import fits_transfer_coordinates, fits_squeeze, fits_crop, fits_clip
+from reproject.mosaicking import reproject_and_coadd, find_optimal_celestial_wcs
+from reproject import reproject_interp
+from multiprocessing import Pool
 
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, RBF, RationalQuadratic, Matern
-from sklearn.gaussian_process.kernels import ConstantKernel
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn import preprocessing
 from scipy import interpolate
 from itertools import product
@@ -47,7 +51,7 @@ import bdsf
 if not '/home/kutkin/apertif' in sys.path:
     sys.path.append('/home/kutkin/apertif')
 
-from atools.utils import fits_reconvolve_psf, get_tid_beam, fits_operation
+from atools.utils import fits_reconvolve_psf, get_tid_beam, fits_operation, fits_transpose
 from atools.catalogs import cross_match, load_nvss
 from dataqa.continuum.validation_tool import (radio_image, validation)
 
@@ -71,21 +75,29 @@ def process(beam):
         cat1 = f'/kutkin/beams/{beam}/' + basename+'.csv'
         hdrfile = f'/kutkin/beams/{beam}/' + basename+'.hdr'
         commoncat = f'/kutkin/beams/{beam}/' + basename+'_cm.csv'
-        if os.path.exists(cat1) and os.path.exists(commoncat) and os.path.exists(hdrfile):
-            logging.debug('Files exist. Skipping...')
-            continue
-        tmp = f'/kutkin/beams/{beam}/{tid}_{beam}_tmp.fits'
-        copyfile(f, tmp)
-# reconvolve with NVSS PSF:
-        tmp=fits_reconvolve_psf(tmp, nvss_psf)
-# source finding
-        img = bdsf.process_image(tmp)
-        img.write_catalog(outfile=cat1, format='csv', clobber=True, catalog_type='srl')
-# save header
-        hdr = fits.getheader(tmp)
-        wcs = WCS(hdr).dropaxis(-1).dropaxis(-1)
-        df = cross_match(cat1, df2)
-        df.to_csv(commoncat, index=False)
+        result = f'/kutkin/beams/{beam}/APERTIF_NVSS_relation.dat'
+
+        # if os.path.exists(result):
+        #     logging.debug('Result file exists %s', result)
+        #     continue
+        if os.path.exists(commoncat) and os.path.exists(hdrfile):
+            df = pd.read_csv(commoncat)
+            wcs = WCS(hdrfile).dropaxis(-1).dropaxis(-1)
+        else:
+            tmp = f'/kutkin/beams/{beam}/{tid}_{beam}_tmp.fits'
+            copyfile(f, tmp)
+    # reconvolve with NVSS PSF:
+            tmp=fits_reconvolve_psf(tmp, nvss_psf)
+    # source finding
+            img = bdsf.process_image(tmp)
+            img.write_catalog(outfile=cat1, format='csv', clobber=True, catalog_type='srl')
+    # save header
+            hdr = fits.getheader(tmp)
+            wcs = WCS(hdr).dropaxis(-1).dropaxis(-1)
+            df = cross_match(cat1, df2)
+            df.to_csv(commoncat, index=False)
+            hdr.tofile(hdrfile)
+            os.remove(tmp)
         radec = [list(df.RA_1.values), list(df.DEC_1.values)]
         xi, yi = wcs.all_world2pix(radec[0], radec[1], 1)
         xi = [_-1537 for _ in xi]
@@ -94,12 +106,10 @@ def process(beam):
         x += xi
         y += yi
         z += zi
-        with open(f'/kutkin/beams/{beam}/result.dat', 'a+') as out:
+        with open(result, 'a+') as out:
             for i,j,k in zip(xi,yi,zi):
                 out.write(f'{tid} {beam} {i} {j} {k}\n')
         # print(df)
-        hdr.tofile(hdrfile)
-        os.remove(tmp)
     return
 
 
@@ -108,14 +118,14 @@ def gpr(x,y,z):
     note the narrow priors -- l=340 ~ 22 arcmin for apercal (!) images
     """
     zmean = np.mean(z)
-    kernel = ConstantKernel(0.2) * RBF([330, 330], (280, 400)) + \
-              ConstantKernel(0.05) * RBF([0.1, 0.1], (1e-2, 1))
-             # ConstantKernel(0.05) * Matern([.1,.1], (1e-3,10), 1.5)
+    kernel = ConstantKernel(0.2**2) * RBF([330, 330], (200, 500)) + \
+              ConstantKernel(0.05**2) * RBF([0.1, 0.1], (1e-2, 100)) + WhiteKernel(0.001)
     gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=25)
-    logging.info(gp.kernel)
-    X = np.stack((x,y)).T
+    logging.info('Gaussian processing')
+    logging.info('Starting kernel %s', gp.kernel)
+    X = np.stack((y,x)).T
     gp.fit(X, z-zmean)
-    logging.info(gp.kernel_)
+    logging.info('Learned kernel %s', gp.kernel_)
     return gp
 
 
@@ -129,79 +139,46 @@ def gpload(fname):
         return pkl.load(out)
 
 
-def gppredict(gp, shape=1200, size=100):
+def gppredict(gp, shape=750, size=100, normalize=True):
     x1 = np.linspace(-shape, shape, size) #p
     x2 = np.linspace(-shape, shape, size) #q
     x1x2 = np.array(list(product(x1, x2)))
+# Use the prediction from the major part of the kernel:
+    if 'k2__noise_level' in gp.kernel_.get_params(): # if white kernell is used...
+        gp.kernel_.set_params(k2=ConstantKernel(0), k1__k2=ConstantKernel(0))
+    else:
+        gp.kernel_.set_params(k2=ConstantKernel(0.0))
     y_pred, MSE = gp.predict(x1x2, return_std=True)
-    Zp = np.reshape(y_pred, (size, size))
-    Zp_err = np.reshape(MSE, (size, size))
-    return Zp, Zp_err, x1x2
-
-
-def gprocess(beam, plots=True):
-    beam = str(beam).zfill(2)
-    arr = np.loadtxt(f'/kutkin/beams/{beam}/result.dat')
-    logging.info(arr.shape)
-    x = arr[:,2]
-    y = arr[:,3]
-    z = arr[:,4]
-    gp = gpr(x,y,z)
-    gpfile = f'/kutkin/beams/{beam}/gpparams_all.dat'
-    kparams = gp.kernel_.get_params()
-    with open(gpfile, 'w') as inp:
-        inp.write(f'kernel {gp.kernel_}\n')
-        for key, val in kparams.items():
-            inp.write(f'{key} {val}\n')
-# predict:
-    data, err, x1x2 = gppredict(gp)
-    data += np.mean(z) # correct for mean
-# scale
-    logging.info('Original data range: {} -- {}'.format(data.min(), data.max()))
-    logging.info('Scaling to [0,1]...')
-    data = (data - np.nanmin(data))/(np.nanmax(data) - np.nanmin(data))
-
-# interpolate -- works
-    grid_x, grid_y = np.mgrid[-1536:1537, -1536:1537]
-    data = interpolate.griddata(x1x2, data.ravel(), (grid_x, grid_y), method='linear')
-    data = np.float32(data)
-# create FITS file:
-    header = fits.getheader(glob.glob(f'/kutkin/beams/{beam}/*.hdr')[0])
-    hdu = fits.PrimaryHDU(data=data, header=header)
-    hdu.writeto(f'/kutkin/beams/{beam}/pb{beam}.fits', overwrite=True)
-
-    if plots:
-        plt.subplot(221)
-        plt.scatter(x, y, s=[10*i/max(z) for i in z])
-        plt.plot(points[:,0], points[:,1], 'k.', ms=1)
-        plt.title(f'Beam {beam}')
-        plt.subplot(222)
-        interval = ZScaleInterval()
-        norm = ImageNormalize(data, interval=interval)
-        X0p, X1p = x1x2[:,0].reshape(shape, shape), x1x2[:,1].reshape(shape,shape)
-        plt.pcolormesh(X0p, X1p, Zp, vmin=-0.01, vmax=0.1, cmap='viridis')
-        plt.title('GPR')
-        plt.subplot(223)
-        plt.imshow(data, origin='lower', vmin=-0.01, vmax=0.1, cmap='viridis')
-        plt.contour(data, [0.1, 0.5], colors='white')
-        plt.title('Linear interp')
-        plt.subplot(224)
-        plt.semilogy(np.hypot(x,y), z, 'o', ms=1)
-        plt.axhline(0.1, ls='--', c='k', lw=0.5)
-        plt.title('Radplot (all PA)')
-        plt.gcf().set_size_inches(8, 8)
-        plt.gcf().tight_layout()
-        plt.gcf().savefig(f'/kutkin/beams/{beam}/gpr_all.png', dpi=150)
-        plt.show()
-    np.save(f'/kutkin/beams/{beam}/all_gp_interp.npy', data)
-    return gp, data
+    arr = np.reshape(y_pred, (size, size))
+    err = np.reshape(MSE, (size, size))
+    if normalize:
+        newarr = (arr - np.nanmin(arr)) / (np.nanmax(arr) - np.nanmin(arr))
+# TODO: check this
+        newerr = err / (np.nanmax(arr) - np.nanmin(arr))
+        return newarr, newerr, x1x2
+    else:
+        return arr, err, x1x2
 
 
 def tid2dt(tid):
     return datetime.datetime.strptime(str(tid)[:6], '%y%m%d')
 
 
-def make_pbeam(tid, beam, nnear=5, maxdt=None, clip=0.05, out=None):
+def _data_within_dt(tid, beam, dt):
+
+    date = tid2dt(tid)
+    df = pd.read_csv(f'/kutkin/beams/{beam}/APERTIF_NVSS_relation.dat', sep='\s+',
+                      names=['tid', 'beam', 'x', 'y', 'z'])
+    tids = sorted(set(df.tid.values))
+    dates = np.array([tid2dt(_) for _ in tids])
+    cond = abs(dates - date) <= datetime.timedelta(dt)
+    tids_to_use = list(np.array(tids)[cond])
+    group = df.query('tid in @tids_to_use')
+    return group
+
+
+def make_pbeam(tid, beam, maxdt=7, nnear=None, clip=0.05, shape=750, size=100,
+               gpfile=None, save_gp_to=None, out=None):
     """
     Create primary beam model (FITS file)
 
@@ -210,11 +187,15 @@ def make_pbeam(tid, beam, nnear=5, maxdt=None, clip=0.05, out=None):
     tid : int or str
     beam : int or str
     nnear : int, optional
-        number of near epochs to append. The default is 5.
+        number of near epochs to append. Ignored if maxdt is set. The default is 5.
     maxdt : int, optional
         maximal time separation of these ephochs (days). If set -- the nnear will be ignored.
     clip : float, optional
         crop the data behind this level. not implemented. The default is 0.05.
+    shape : int, optional
+        the shape to predict GP on (full image is 1536, driftscan pbeams are 500... 750 should include 1st null level
+    size : int, optionsl
+        the size of the output array (NAXIS), driftscans imgaes have 40...
     Returns
     -------
     None.
@@ -222,45 +203,36 @@ def make_pbeam(tid, beam, nnear=5, maxdt=None, clip=0.05, out=None):
 
     beam = str(beam).zfill(2)
     tid = int(tid)
-    date = tid2dt(tid)
-    logging.info('Making pbeam for %s %s (date: %s)', tid, beam, date)
-    df = pd.read_csv(f'/kutkin/beams/{beam}/result.dat', sep='\s+',
-                      names=['tid', 'beam', 'x', 'y', 'z'])
-    tids = sorted(set(df.tid.values))
-    dates = np.array([tid2dt(_) for _ in tids])
-    inds = np.argsort(abs(dates - date))
-    tids_to_use = list(np.array(tids)[inds][:nnear])
-    if maxdt is not None:
-        cond = abs(dates - date) <= datetime.timedelta(maxdt)
-        tids_to_use = list(np.array(tids)[cond])
-        logging.info('Found %d observations within %d days. Processing...', len(tids_to_use), maxdt)
-    else:
-        logging.info('Found %d observations. Processing...', len(tids_to_use))
-    # logging.debug(tids_to_use)
-    group = df.query('tid in @tids_to_use')
-    if group.empty:
-        logging.error('No data!')
-        return
-    logging.info('%d points', len(group))
-    x, y, z = group.x, group.y, group.z
-    gp = gpr(x, y, z)
-    shape = 750
-    size = 100
-    # shape = 500 # for driftscans
-    # size = 40
-    data, err, x1x2 = gppredict(gp, shape=shape, size=size)
-    data += np.mean(z) # correct for mean
-# scale
-    logging.info('Original data range: {} -- {}'.format(data.min(), data.max()))
-    logging.info('Scaling to [0,1]...')
-    data = (data - np.nanmin(data))/(np.nanmax(data) - np.nanmin(data))
+    logging.info('Making pbeam for %s %s (date: %s)', tid, beam, tid2dt(tid))
 
+# GP
+    if gpfile is not None:
+        logging.info('Loading GP-file: %s', gpfile)
+        gp = gpload(gpfile)
+    else:
+        group = _data_within_dt(tid, beam, maxdt)
+        i = 0
+        while len(group) < 500:
+            i += 1
+            logging.warning("Too few data points for GPR... Increasing time interval by %d days", i)
+            group = _data_within_dt(tid, beam, maxdt+i)
+        logging.info('Processing %d sources within %d days', len(group), maxdt+i)
+
+        x, y, z = group.x, group.y, group.z
+        gp = gpr(x, y, z)
+
+# save the full GP:
+    if save_gp_to is not None:
+        gpsave(gp, f'{save_gp_to}')
+# the following modifies GP:
+    data, err, x1x2 = gppredict(gp, shape=shape, size=size, normalize=True)
     data = np.float32(data)
+
     header = fits.getheader(glob.glob(f'/kutkin/beams/{beam}/*.hdr')[0])
     factor = 2.0 * shape / size # increaze of CDELT
-    crdelt1 = header['CDELT1']
+
     header.update(NAXIS1=size, NAXIS2=size, CRPIX1=size/2, CRPIX2=size/2,
-                  CDELT1=header['CDELT1']*factor,CDELT2=header['CDELT2']*factor)
+                  CDELT1=header['CDELT1']*factor, CDELT2=header['CDELT2']*factor)
     for k in ['HISTORY', 'BMAJ', 'BMIN', 'BPA', 'NITERS', 'OBJECT']:
         header.remove(k, remove_all=True)
     s = str(gp.kernel_).split('+')[0]
@@ -310,27 +282,81 @@ def time_evolution():
     plt.show()
 
 
+def _go(beam):
+    # these for the coordinates:
+    tid = 190915041
+    fitsfiles = glob.glob(f'/kutkin/images_apercal/{tid}_{beam}*.fits') or \
+               glob.glob(f'/kutkin/acat/dr1/{tid}_{beam}.fits')
+    fitsfile = fitsfiles[0]
+    # pb = f'/kutkin/beams/{beam}/pb_{beam}_gpall.fits'
+# make new fits:
+    gpfile = f'/kutkin/beams/{beam}/gpall.pkl'
+    good_res_file = f'/kutkin/beams/mosaic/{beam}.fits'
+    if not os.path.exists(good_res_file):
+        gp, data, err, tmpfile = make_pbeam(tid=tid, beam=beam, shape=1000,
+                                            size=500, gpfile=gpfile,
+                                            out=good_res_file)
+    tmpfile = f'/kutkin/beams/mosaic/{beam}_tmp.fits'
+    shutil.copyfile(good_res_file, tmpfile)
+
+# squeeze, transfer coordinates crop, clip:
+    tmpfile = fits_squeeze(tmpfile)
+    fits_transfer_coordinates(fitsfile, tmpfile)
+    tmpfile, _ = fits_crop(tmpfile, level=0.05)
+    tmpfile = fits_clip(tmpfile, level=0.15, out=tmpfile)
+    return tmpfile
+
+
+def mosaic_pbeams():
+
+    beams = [str(_).zfill(2) for _ in range(40)]
+    # p = Pool(1)
+    # p.map(_go, beams)
+    # pbs = glob.glob('/kutkin/beams/mosaic/*_tmp.fits')
+    pbs = []
+    for beam in beams:
+        pbs.append(_go(beam))
+
+    clip=0.15 # change above
+    wcs_out, shape_out = find_optimal_celestial_wcs(pbs, auto_rotate=False)
+    array, footprint = reproject_and_coadd(pbs, wcs_out, shape_out=shape_out,
+                                            reproject_function=reproject_interp,
+                                            combine_function='sum')
+    array = np.float32(array)
+    hdr = wcs_out.to_header()
+    fits.writeto('/kutkin/beams/mosaic/pbmosaic{:d}.fits'.format(int(clip*100)), data=array,
+                  header=hdr, overwrite=True)
+
+
 def pball(beam):
 
     gp, data, err, out = make_pbeam(191010000, beam, maxdt=365,
-                                    out=f'/kutkin/beams/{beam}/pb_{beam}_gpall.fits')
-    gpsave(gp, f'/kutkin/beams/{beam}/gpall.pkl')
-    np.save(f'/kutkin/beams/{beam}/data_gpall.npy', data)
-    np.save(f'/kutkin/beams/{beam}/err_gpall.npy', err)
+                                    out=f'/kutkin/beams/{beam}/pb_{beam}_gpall.fits',
+                                    save_gp_to=f'/kutkin/beams/{beam}/gpall.pkl')
+    # np.save(f'/kutkin/beams/{beam}/data_gpall.npy', data)
+    # np.save(f'/kutkin/beams/{beam}/err_gpall.npy', err)
 
 
 # def pbplot(ffile):
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
+
+    # gp1, data1, err1, out = make_pbeam(200101000, 7, maxdt=7, clip=0.05, out=None)
+    # gp2, arr2, err2, out = make_pbeam(190915041, 1, maxdt=7, clip=0.05, out=None)
+
 
 #%% bulk process all the data to get the A/N relation
+    # from multiprocessing import Pool
     # beams = [str(_).zfill(2) for _ in range(40)]
-    # # for b in beams[::2]:
-    # # for b in beams[::2][::-1]:
-    # # for b in beams[1::2]:
+    # p = Pool(40)
+    # p.map(process, beams)
+# use "for" if bdsf involved...
+    # for b in beams[::2]:
+    # for b in beams[::2][::-1]:
+    # for b in beams[1::2]:
     # for b in beams[1::2][::-1]:
-    #     process(b)
+        # process(b)
 #%% compare to drift scans -- the latter seem to be WRONG, e.g. beam 01 (see files in /kutkin/test/compare_gpbeams_with_driftscans)
     # tid = 191120000 # fake TID corresponding to drift scans date
     # beam = 1 # beam 1 differs most dramatically -- 90 degrees rotation?
@@ -339,23 +365,19 @@ if __name__ == "__main__":
 #%% GPall (make pbeams for all beam images):
     # from multiprocessing import Pool
     # beams = [str(_).zfill(2) for _ in range(40)]
-    # p = Pool(10)
+    # p = Pool(len(beams))
     # p.map(pball, beams)
-#%% mosaic plot
-    beams = [str(_).zfill(2) for _ in range(40)]
-    tid = 190915041
-    path = '/kutkin/test/mosaic_with_gpbeams'
-    for beam in beams:
-        os.chdir(path)
-        if os.path.exists(f'{path}/gp{beam}.pkl'):
-            continue
-        try:
-            gp, data, err, out = make_pbeam(tid, beam, maxdt=14, out=f'{path}/{tid}_{beam}_pb.fits')
-            gpsave(gp, f'{path}/gp{beam}.pkl')
-            np.save(f'{path}/data{beam}.npy', data)
-            np.save(f'{path}/err{beam}.npy', err)
-        except Exception as e:
-            logging.exception(e)
+
+#%% mosaic plot -- works...
+    # mosaic_pbeams()
+
+#%% plots
+#    see figures script in acat
+        # print(gp)
+
+
+
+
 #%% test - passed
 
 # img = '/home/kutkin/mnt/hyperion/kutkin/beams/00/test/191227013_00.fits'
